@@ -1,120 +1,141 @@
 /**
-* Pixiv bulk private/public follows
-* 
-* Sets all your follows from public to private or vice-versa based on the type viewed.
-* To be used from your "Following" page.
-*
-* Wrapped in an IIFE for browser compatibility.
-*/
-
+ * Pixiv bulk private/public follows
+ *
+ * Sets all your follows from public to private or vice-versa based on the type viewed.
+ * Uses Pixiv's stable Ajax endpoints instead of DOM scraping, ensuring longevity.
+ *
+ * Wrapped in an IIFE for browser compatibility.
+ */
 (async function iife() {
+  'use strict';
 
-// --------------------- If you have errors, please check that these classes are correct ---------------------
-const FollowCount_Class = 'sc-1mr081w-0 kZlOCw' // Number next to "Users"
-const ArtistName_Class = 'sc-d98f2c-0 sc-19z9m4s-2 QHGGh' // Artist's name
-const DropdownMenuButton_Class = 'sc-1ij5ui8-0 QihHO sc-125tkm8-2 gUcOiA' // Dropdown menu button
-const PrivatePublicButton_Class =  'sc-1o6692m-0 hVxezo gtm-profile-user-menu-restrict-changing' // Private/public button
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const tag = '%c[pixiv-bulk-follow]';
+  const log  = (...a) => console.log(tag, 'color:#0096fa;font-weight:bold', ...a);
+  const warn = (...a) => console.warn(tag, 'color:#ff9800;font-weight:bold', ...a);
+  const err  = (...a) => console.error(tag, 'color:#ff4060;font-weight:bold', ...a);
 
+  // ---------- 1. Determine user + flip direction ----------
+  const path = location.pathname.replace(/^\/en/, '');
+  const m = path.match(/^\/users\/(\d+)\/following/);
+  if (!m) throw new Error('Run this on your Following page (/users/<id>/following).');
+  const myUserId = m[1];
+  const viewingPrivate = new URLSearchParams(location.search).get('rest') === 'hide';
+  const sourceRest     = viewingPrivate ? 'hide' : 'show';
+  const targetRestrict = viewingPrivate ? 0 : 1;        // 0 = public, 1 = private
+  const targetLabel    = targetRestrict === 1 ? 'private' : 'public';
 
-function getSafe(fn, defaultVal) {
-	try {
-	  return fn();
-	} catch (e) {
-	  return defaultVal;
-	}
-}
+  if (!confirm(
+    `Bulk follow conversion\n\n` +
+    `Viewing your ${viewingPrivate ? 'PRIVATE' : 'PUBLIC'} follows.\n` +
+    `All will be set to ${targetLabel.toUpperCase()}.\n\nProceed?`
+  )) { log('Aborted.'); return; }
 
-const sleep = ms => new Promise(res => setTimeout(res, ms));
+  log(`Converting ${viewingPrivate ? 'private→public' : 'public→private'} (target restrict = ${targetRestrict}).`);
 
-var FollowCount = 0
-var FollowsEdited = 0
+  // ---------- 2. CSRF token ----------
+  function getCsrfToken() {
+    // Primary: Parse from Next.js state
+    try {
+      const nd = document.getElementById('__NEXT_DATA__');
+      if (nd && nd.textContent) {
+        const data = JSON.parse(nd.textContent);
+        const serialized = data?.props?.pageProps?.serverSerializedPreloadedState;
+        if (typeof serialized === 'string') {
+          const state = JSON.parse(serialized);
+          if (state?.api?.token) return state.api.token;
+        }
+      }
+    } catch (_) {}
+    
+    // Fallback 1: Legacy global
+    try {
+      if (window.pixiv?.context?.token) return window.pixiv.context.token;
+    } catch (_) {}
 
-// Get the follow count
-var FollowCount = getSafe(() => document.getElementsByClassName(FollowCount_Class)[0].getElementsByTagName('span')[0].textContent,'not-found').replace(/\D/g, "")
+    // Fallback 2: Regex search the raw HTML for the token
+    try {
+      const html = document.documentElement.innerHTML;
+      const match = html.match(/"token":"([a-z0-9]+)"/i);
+      if (match && match[1]) return match[1];
+    } catch (_) {}
 
-// error checking for follow count
-if (FollowCount == 'not-found') {
-	console.warn('Could not find follow count.')
-} else {
-	console.log(`Found ${FollowCount} follows.`)
-}
+    throw new Error('CSRF token not found — make sure you are logged in to pixiv.');
+  }
+  const csrf = getCsrfToken();
+  log('CSRF token acquired.');
 
-var OldArtistName = ""
+  // ---------- 3. Read follow list ----------
+  const LIMIT = 24;
+  async function fetchFollowing(rest, offset) {
+    const url = `https://www.pixiv.net/ajax/user/${myUserId}/following?offset=${offset}&limit=${LIMIT}&rest=${rest}`;
+    const res = await fetch(url, { credentials:'same-origin', headers:{ Accept:'application/json' } });
+    if (res.status === 401 || res.status === 403) throw new Error('Not authorized — log in to pixiv.');
+    if (!res.ok) throw new Error(`Following list HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.error) throw new Error(json.message || 'Ajax following API error.');
+    return json.body;
+  }
 
-while ((FollowsEdited < FollowCount) || (FollowCount == 'not-found')) {
-	
-	// --------------------- Wait for follow list to refresh ---------------------
-	var DurationCounter = 0
-	while (true) {
+  const first = await fetchFollowing(sourceRest, 0);
+  const total = (typeof first.total === 'number') ? first.total : (first.users?.length || 0);
+  if (!total) { log('No follows to convert.'); return; }
+  log(`Found ${total} ${viewingPrivate ? 'private' : 'public'} follow(s).`);
 
-		// Get the first name in the list
-		var ArtistName = getSafe(() => document.getElementsByClassName(ArtistName_Class)[0].textContent)
+  const userIds = [];
+  let offset = 0, body = first;
+  while (true) {
+    const users = Array.from(body.users || []);
+    if (!users.length) break;
+    for (const u of users) if (u?.userId) userIds.push(u.userId);
+    offset += users.length;
+    if ((typeof body.total === 'number' && offset >= body.total) || users.length < LIMIT) break;
+    await sleep(300);
+    body = await fetchFollowing(sourceRest, offset);
+  }
+  log(`Collected ${userIds.length} user(s). Starting conversion…`);
 
-		// Check if the name is new
-		if ((ArtistName != OldArtistName) && (typeof ArtistName != 'undefined')) {
-			break
-		}
-		
-		DurationCounter++
+  // ---------- 4. Change restrict via /ajax/following/user/restrict_change ----------
+  let done = 0, failed = 0;
+  const failedIds = [];
 
-		// Stop the script after 10 seconds of no progress
-		if (DurationCounter > 100) {
-			if (FollowsEdited >= 1) {
-				throw new Error('No new follows found, script stopped.');
-			}else {
-				throw new Error('Could not find the artist name, check the guide for help with updating the class name.');
-			}	
-		}
+  for (const id of userIds) {
+    const params = new URLSearchParams({
+      user_id: String(id),
+      restrict: String(targetRestrict),
+    });
+    try {
+      const res = await fetch('https://www.pixiv.net/ajax/following/user/restrict_change', {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'x-csrf-token': csrf,
+        },
+        body: params,
+        credentials: 'same-origin',
+      });
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try { const j = await res.json(); detail = j.message || detail; } catch (_) {}
+        throw new Error(detail);
+      }
+      done++;
+      log(`${done}/${userIds.length}: ${id} → ${targetLabel}`);
+    } catch (e) {
+      failed++;
+      failedIds.push(id);
+      warn(`${id} FAILED: ${e.message}`);
+    }
+    await sleep(700); // ~1/sec to avoid rate limiting
+  }
 
-		await sleep(100)
-	}
-	OldArtistName = ArtistName
-
-	
-	// --------------------- Click the buttons ---------------------
-	var DurationCounter = 0
-	while (true) {
-
-		var Button = document.getElementsByClassName(PrivatePublicButton_Class)[0]
-		var ButtonAriaDisabled = getSafe(() => Button.getAttribute('aria-disabled'))
-		
-		// Click private/public button when it exists & isn't disabled
-		if (ButtonAriaDisabled == 'false')
-		{
-			Button.click()
-			break
-		}
-
-		// Click the follow dropdown menu button if the private/public button is not visible
-		if (ButtonAriaDisabled != 'true') {
-			getSafe(() => document.getElementsByClassName(DropdownMenuButton_Class)[0].click())
-		}
-
-		DurationCounter++
-
-		// Stop the script after 10 seconds of no progress
-		if (DurationCounter > 100) {
-			if (!document.getElementsByClassName(DropdownMenuButton_Class)[0])
-			{
-				throw new Error('Could not find the dropdown menu button, check the guide for help with updating the class name.');
-			} else {
-				throw new Error('Could not find the "Set as private/public" button, check the guide for help with updating the class name.');
-			}
-		}
-
-		await sleep(100)
-	}
-	
-	FollowsEdited++
-	// error checking for follow count
-	if (FollowCount != 'not-found') {
-		console.log(`Changed ${FollowsEdited}/${FollowCount} follows, ${FollowCount - FollowsEdited} remaining.`)
-	} else {
-		console.log(`Changed ${FollowsEdited} follows.`)
-	}
-	
-}
-
-console.log('Script finished.')
-
-})()
+  log(`Done. ${done} converted, ${failed} failed.`);
+  if (failedIds.length) {
+    err('Failed IDs:', failedIds.join(', '));
+  } else {
+    log('Reloading in 1s…');
+    await sleep(1000);
+    location.reload();
+  }
+})();
